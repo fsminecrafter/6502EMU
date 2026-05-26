@@ -1,0 +1,505 @@
+; =============================================================================
+; ADVANCED 6502 NASM TEST SUITE
+; Tests: arithmetic, logic, shifts, branches, stack, subroutines,
+;        indirect addressing, string output, multiply routine, fibonacci
+; Output via UART at $6000
+; =============================================================================
+
+UART_DATA   EQU $6000
+UART_STATUS EQU $6001
+
+; Zero-page scratch
+ZP_TMP0     EQU $00
+ZP_TMP1     EQU $01
+ZP_TMP2     EQU $02
+ZP_TMP3     EQU $03
+ZP_LO       EQU $04
+ZP_HI       EQU $05
+ZP_PTR      EQU $06     ; 2-byte pointer for indirect addressing
+ZP_RES      EQU $08     ; multiply result (2 bytes)
+
+ORG $0200
+
+; -----------------------------------------------------------------------------
+; ENTRY POINT
+; -----------------------------------------------------------------------------
+entry:
+    LDX #$FF
+    TXS                 ; stack -> $01FF
+
+    JSR test_arithmetic
+    JSR test_logic
+    JSR test_shifts
+    JSR test_stack
+    JSR test_branches
+    JSR test_indirect
+    JSR test_multiply
+    JSR test_fibonacci
+    JSR print_done
+    BRK
+
+; =============================================================================
+; SECTION 1 – ARITHMETIC
+; =============================================================================
+test_arithmetic:
+    JSR print_arith_hdr
+
+    ; --- 1a: simple ADC ---
+    CLC
+    LDA #$14            ; 20
+    ADC #$0A            ; + 10 = 30 ($1E)
+    JSR print_hex       ; expect 1E
+
+    JSR print_space
+
+    ; --- 1b: ADC with carry in ---
+    SEC
+    LDA #$FF
+    ADC #$00            ; $FF + 0 + C = $00, carry set
+    JSR print_hex       ; expect 00
+
+    JSR print_space
+
+    ; --- 1c: SBC  ---
+    SEC
+    LDA #$50            ; 80
+    SBC #$30            ; - 48 = 32 ($20)
+    JSR print_hex       ; expect 20
+
+    JSR print_space
+
+    ; --- 1d: overflow flag test (positive + positive = negative) ---
+    CLC
+    LDA #$60            ; +96
+    ADC #$40            ; +64  -> $A0 = -96 (overflow!)
+    JSR print_hex       ; expect A0
+
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 2 – LOGIC (AND / ORA / EOR)
+; =============================================================================
+test_logic:
+    JSR print_logic_hdr
+
+    LDA #$FF
+    AND #$0F
+    JSR print_hex       ; expect 0F
+
+    JSR print_space
+
+    LDA #$00
+    ORA #$A5
+    JSR print_hex       ; expect A5
+
+    JSR print_space
+
+    LDA #$FF
+    EOR #$55
+    JSR print_hex       ; expect AA
+
+    JSR print_space
+
+    ; BIT test – set zero flag when A & M == 0
+    LDA #$0F
+    STA ZP_TMP0
+    LDA #$F0
+    BIT ZP_TMP0         ; A($F0) & M($0F) = 0  -> Z=1
+    BEQ bit_ok
+    LDA #$45            ; 'E' – should not reach
+    JMP bit_done
+bit_ok:
+    LDA #$4F            ; 'O' for OK
+bit_done:
+    JSR print_char
+
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 3 – SHIFTS & ROTATES
+; =============================================================================
+test_shifts:
+    JSR print_shift_hdr
+
+    ; ASL accumulator  $01 << 3 = $08
+    LDA #$01
+    ASL A
+    ASL A
+    ASL A
+    JSR print_hex       ; expect 08
+
+    JSR print_space
+
+    ; LSR  $80 >> 3 = $10
+    LDA #$80
+    LSR A
+    LSR A
+    LSR A
+    JSR print_hex       ; expect 10
+
+    JSR print_space
+
+    ; ROL through carry: $40 with C=1 -> $81
+    SEC
+    LDA #$40
+    ROL A
+    JSR print_hex       ; expect 81
+
+    JSR print_space
+
+    ; ROR  $02 with C=0 -> $01
+    CLC
+    LDA #$02
+    ROR A
+    JSR print_hex       ; expect 01
+
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 4 – STACK PUSH/PULL
+; =============================================================================
+test_stack:
+    JSR print_stack_hdr
+
+    LDA #$DE
+    PHA
+    LDA #$AD
+    PHA
+    LDA #$BE
+    PHA
+    LDA #$EF
+    PHA
+
+    ; pull in LIFO order: EF BE AD DE
+    PLA
+    JSR print_hex
+    JSR print_space
+    PLA
+    JSR print_hex
+    JSR print_space
+    PLA
+    JSR print_hex
+    JSR print_space
+    PLA
+    JSR print_hex
+
+    ; PHP / PLP round-trip
+    SEC             ; set carry
+    SEI             ; set interrupt
+    PHP
+    CLC             ; clear carry
+    CLI             ; clear interrupt
+    PLP             ; restore: carry+interrupt should be set again
+    BCS stack_carry_ok
+    JMP stack_carry_fail
+stack_carry_ok:
+    LDA #$43        ; 'C'
+    JSR print_char
+    JMP stack_end
+stack_carry_fail:
+    LDA #$46        ; 'F'
+    JSR print_char
+stack_end:
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 5 – BRANCH / LOOP  (count 0..4, print each)
+; =============================================================================
+test_branches:
+    JSR print_branch_hdr
+
+    LDX #$00
+branch_loop:
+    TXA
+    CLC
+    ADC #$30            ; ASCII '0' + X
+    JSR print_char
+    INX
+    CPX #$05
+    BNE branch_loop
+
+    ; DECREMENT loop: Y from 5 down to 1
+    LDY #$05
+dec_loop:
+    TYA
+    CLC
+    ADC #$30
+    JSR print_char
+    DEY
+    BNE dec_loop
+
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 6 – INDIRECT ADDRESSING  (write string via (zp),Y)
+; =============================================================================
+test_indirect:
+    JSR print_indirect_hdr
+
+    ; Point ZP_PTR at greet_str
+    LDA #<greet_str
+    STA ZP_PTR
+    LDA #>greet_str
+    STA ZP_PTR+1
+
+    LDY #$00
+indirect_loop:
+    LDA (ZP_PTR),Y
+    BEQ indirect_done
+    STA UART_DATA
+    INY
+    JMP indirect_loop
+indirect_done:
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; SECTION 7 – 8×8 UNSIGNED MULTIPLY  (shift-and-add)
+; Input:  ZP_TMP0 = multiplicand,  ZP_TMP1 = multiplier
+; Output: ZP_RES(lo), ZP_RES+1(hi)  printed as 16-bit hex
+; Test:   13 × 11 = 143 ($008F)
+; =============================================================================
+test_multiply:
+    JSR print_mul_hdr
+
+    LDA #$0D            ; 13
+    STA ZP_TMP0
+    LDA #$0B            ; 11
+    STA ZP_TMP1
+    JSR mul8
+    ; print hi byte then lo byte
+    LDA ZP_RES+1
+    JSR print_hex
+    LDA ZP_RES
+    JSR print_hex       ; expect 008F
+
+    JSR print_space
+
+    ; second test: 255 × 255 = 65025 ($FE01)
+    LDA #$FF
+    STA ZP_TMP0
+    LDA #$FF
+    STA ZP_TMP1
+    JSR mul8
+    LDA ZP_RES+1
+    JSR print_hex
+    LDA ZP_RES
+    JSR print_hex       ; expect FE01
+
+    JSR print_newline
+    RTS
+
+; mul8 subroutine
+mul8:
+    LDA #$00
+    STA ZP_RES
+    STA ZP_RES+1
+    LDX #$08            ; 8 bits
+mul8_loop:
+    LSR ZP_TMP1         ; shift multiplier right, bit into carry
+    BCC mul8_skip
+    CLC
+    LDA ZP_RES
+    ADC ZP_TMP0
+    STA ZP_RES
+    LDA ZP_RES+1
+    ADC #$00
+    STA ZP_RES+1
+mul8_skip:
+    ASL ZP_TMP0         ; shift multiplicand left
+    DEX
+    BNE mul8_loop
+    RTS
+
+; =============================================================================
+; SECTION 8 – FIBONACCI  (first 8 terms printed as hex bytes)
+; F: 01 01 02 03 05 08 0D 15
+; =============================================================================
+test_fibonacci:
+    JSR print_fib_hdr
+
+    LDA #$01
+    STA ZP_TMP0         ; F(n-2)
+    LDA #$01
+    STA ZP_TMP1         ; F(n-1)
+    LDX #$08            ; print 8 terms
+
+    ; print first two manually
+    LDA ZP_TMP0
+    JSR print_hex
+    JSR print_space
+    LDA ZP_TMP1
+    JSR print_hex
+    JSR print_space
+    DEX
+    DEX
+
+fib_loop:
+    CLC
+    LDA ZP_TMP0
+    ADC ZP_TMP1
+    STA ZP_TMP2         ; F(n) = F(n-2) + F(n-1)
+    LDA ZP_TMP1
+    STA ZP_TMP0
+    LDA ZP_TMP2
+    STA ZP_TMP1
+    JSR print_hex
+    JSR print_space
+    DEX
+    BNE fib_loop
+
+    JSR print_newline
+    RTS
+
+; =============================================================================
+; UTILITY SUBROUTINES
+; =============================================================================
+
+; --- print_hex: print A as two hex digits via UART ---
+print_hex:
+    PHA
+    LSR A
+    LSR A
+    LSR A
+    LSR A
+    JSR nibble_to_ascii
+    STA UART_DATA
+    PLA
+    AND #$0F
+    JSR nibble_to_ascii
+    STA UART_DATA
+    RTS
+
+nibble_to_ascii:
+    CMP #$0A
+    BCC nibble_digit
+    ADC #$06            ; 'A'-'9'-1  (carry already set from CMP>=10)
+nibble_digit:
+    ADC #$30            ; '0'
+    RTS
+
+; --- print_char: print A as ASCII ---
+print_char:
+    STA UART_DATA
+    RTS
+
+; --- print_space ---
+print_space:
+    LDA #$20
+    STA UART_DATA
+    RTS
+
+; --- print_newline ---
+print_newline:
+    LDA #$0D
+    STA UART_DATA
+    LDA #$0A
+    STA UART_DATA
+    RTS
+
+; --- print_str: print null-terminated string pointed to by ZP_PTR ---
+print_str:
+    LDY #$00
+print_str_loop:
+    LDA (ZP_PTR),Y
+    BEQ print_str_done
+    STA UART_DATA
+    INY
+    JMP print_str_loop
+print_str_done:
+    RTS
+
+; --- section header helpers (inline string trick via ZP_PTR) ---
+print_arith_hdr:
+    LDA #<hdr_arith
+    STA ZP_PTR
+    LDA #>hdr_arith
+    STA ZP_PTR+1
+    JMP print_str
+
+print_logic_hdr:
+    LDA #<hdr_logic
+    STA ZP_PTR
+    LDA #>hdr_logic
+    STA ZP_PTR+1
+    JMP print_str
+
+print_shift_hdr:
+    LDA #<hdr_shift
+    STA ZP_PTR
+    LDA #>hdr_shift
+    STA ZP_PTR+1
+    JMP print_str
+
+print_stack_hdr:
+    LDA #<hdr_stack
+    STA ZP_PTR
+    LDA #>hdr_stack
+    STA ZP_PTR+1
+    JMP print_str
+
+print_branch_hdr:
+    LDA #<hdr_branch
+    STA ZP_PTR
+    LDA #>hdr_branch
+    STA ZP_PTR+1
+    JMP print_str
+
+print_indirect_hdr:
+    LDA #<hdr_indirect
+    STA ZP_PTR
+    LDA #>hdr_indirect
+    STA ZP_PTR+1
+    JMP print_str
+
+print_mul_hdr:
+    LDA #<hdr_mul
+    STA ZP_PTR
+    LDA #>hdr_mul
+    STA ZP_PTR+1
+    JMP print_str
+
+print_fib_hdr:
+    LDA #<hdr_fib
+    STA ZP_PTR
+    LDA #>hdr_fib
+    STA ZP_PTR+1
+    JMP print_str
+
+print_done:
+    LDA #<hdr_done
+    STA ZP_PTR
+    LDA #>hdr_done
+    STA ZP_PTR+1
+    JMP print_str
+
+; =============================================================================
+; DATA
+; =============================================================================
+
+hdr_arith:
+    DB "[ARITH]  ADC/SBC results: ", 0
+hdr_logic:
+    DB "[LOGIC]  AND/ORA/EOR/BIT: ", 0
+hdr_shift:
+    DB "[SHIFT]  ASL/LSR/ROL/ROR: ", 0
+hdr_stack:
+    DB "[STACK]  PHA/PLA/PHP/PLP: ", 0
+hdr_branch:
+    DB "[BRANCH] count loops:     ", 0
+hdr_indirect:
+    DB "[INDIR]  (zp),Y string:   ", 0
+hdr_mul:
+    DB "[MUL]    8x8 multiply:    ", 0
+hdr_fib:
+    DB "[FIB]    fibonacci seq:   ", 0
+hdr_done:
+    DB $0D, $0A, "All tests complete.", $0D, $0A, 0
+
+greet_str:
+    DB "Hello via (zp),Y!", 0
